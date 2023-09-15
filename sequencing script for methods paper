@@ -1,0 +1,273 @@
+#High Efficiency Microbial DNA Extraction Method for Avian Feces and Preen Oil Script
+#for the additional samples shown in the sequenced data from Figure 3
+
+
+cd /Users/russ/Desktop/aims_1_2_seq #go to your folder with all of your fastq files
+find . -mindepth 2 -type f -print -exec mv {} . \; #move fastqs from subdirectories to working directory
+rm -r -- ./*/ #remove now empty folders
+
+#TRIMMING OFF PRIMERS WITH CUTADAPT
+conda activate cutadaptenv #activate cutadapt environment
+mkdir fastq-primers-trimmed #make directory for trimmed fastqs
+
+#run the primer trimming step in a for loop for each sample
+for i in *_R1_001.fastq.gz;
+do
+  SAMPLE=$(echo ${i} | sed "s/_R1_\001\.fastq.gz//") 
+  echo ${SAMPLE}_R1_001.fastq.gz ${SAMPLE}_R2_001.fastq.gz
+  cutadapt \
+    -g ^CCTACGGGAGGCAGCAG \
+    -G ^GACTACHVGGGTATCTAATCC \
+    -n 1 \
+    -O 5 \
+    --action trim --discard-untrimmed \
+    --minimum-length 5 \
+    --pair-filter=any \
+    -o fastq-primers-trimmed/primers-trimmed-${SAMPLE}_R1_001.fastq.gz -p fastq-primers-trimmed/primers-trimmed-${SAMPLE}_R2_001.fastq.gz \
+    ${SAMPLE}_R1_001.fastq.gz ${SAMPLE}_R2_001.fastq.gz
+done
+
+conda deactivate #deactivate the environment
+
+cd fastq-primers-trimmed 
+gunzip *.fastq.gz #unzip fastqs
+find . -name '*.fastq' -size 0 -print0 | xargs -0 rm #delete files of size 0
+cd ..
+
+#QUALITY FILTERING, DENOISING AND GENERATING ASV TABLE/SEQUENCE LIST WITH DADA2
+#switch over to using R
+
+library(dada2) #call on dada2 package
+library(tidyverse) # call on package for data manipulatin'
+library(phyloseq) #package required for decontamination, also good for many analyses
+library(decontam) #'decontaminates' your samples, includes different methods to do this
+
+setwd("~/Desktop/full_sequencing") #set working directory
+
+
+path <- "fastq-primers-trimmed" #setting the relative path to the trimmed fastq files
+fns <- list.files(path, pattern=".fastq", full.names=TRUE) #defining the file names
+head(fns) #checking that I properly navigated to the correct path
+
+#now define the forward and reverse files![<# alt text #>](../../../Desktop/Bigbirdnewversion.webp "Bigbirdnewversion.webp")
+fnFs <- list.files(path, pattern="_R1_001.fastq", full.names=TRUE)
+fnRs <- list.files(path, pattern="_R2_001.fastq", full.names=TRUE)
+head(fnFs)
+
+plotQualityProfile(fnFs[1:2]) #plot quality of forward reads, choosing first two samples and negatives
+
+pdf(paste("/Users/russ/Desktop/full_sequencing/q_plot_F.pdf"), width = 6, height = 4)
+print(q_plot_F)
+dev.off()
+
+q_plot_R <- plotQualityProfile(fnRs) #plot quality of reverse reads, choosing first two samples and negatives
+
+pdf(paste("/Users/russ/Desktop/full_sequencing/q_plot_R.pdf"), width = 6, height = 4)
+print(q_plot_R)
+dev.off()
+
+#dereplication
+
+#filtering with default paramaters and truncating to length based on quality profiles
+filtFs <- file.path(path, "filtered", basename(fnFs)) #directory for filtered forward reads
+filtRs <- file.path(path, "filtered", basename(fnRs)) #directory for filtered reverse reads
+
+out <- filterAndTrim(fnFs, filtFs, fnRs, filtRs, truncLen=c(120, 105)) #fix truncLen based on quality score stuff
+
+#denoising and removing chimeras
+errF <- learnErrors(filtFs, multi=TRUE)
+errR <- learnErrors(filtRs, multi=TRUE)
+
+#plotting error models
+plotErrors(errF, nominalQ=TRUE)
+plotErrors(errR, nominalQ=TRUE)
+
+pdf(paste("/Users/russ/Desktop/full_sequencing/e_plot_F.pdf"), width = 6, height = 4)
+print(e_plot_F)
+dev.off()
+
+#DADA those baby boys
+ddF <- dada(filtFs, errF, pool="pseudo", multi=TRUE) #note the pseudopooling option and the detection of singletons is enabled
+ddR <- dada(filtRs, errR, pool="pseudo", multi=TRUE)
+
+merged <- mergePairs(ddF, filtFs, ddR, filtRs, verbose=TRUE, justConcatenate = FALSE) #concatenate (meshes reads together).  False because i don't want concatenated. merge them because there is overlap only not merge with miniseq bc no overlap
+
+#construct the table
+table.chimeras <- makeSequenceTable(cat)
+dim(table.chimeras)
+
+#remove chimeras
+table.no.chimeras <- removeBimeraDenovo(table.chimeras, multi=TRUE, verbose=TRUE)
+sum(table.no.chimeras)/sum(table.chimeras)
+
+#export this table as a text file
+write.table(t(table.no.chimeras), file = 'table.tsv', sep = "\t", row.names = TRUE, col.names=NA, quote=FALSE)
+
+#at this point I'd also like to export the sequences
+uniquesToFasta(table.no.chimeras, fout='rep-seqs.fasta', ids = colnames(table.no.chimeras))
+
+#check the pipeline (from primer removal and beyond)
+getN <- function(x) sum(getUniques(x))
+
+
+summary_tab <- data.frame(row.names=fnFs, dada2_input=out[,1],
+                          filtered=out[,2], ddF=sapply(ddF, getN),
+                          ddR=sapply(ddR, getN), merged=sapply(merged, getN),
+                          table.no.chimeras=rowSums(table.no.chimeras),
+                          final_perc_reads_retained=round(rowSums(table.no.chimeras)/out[,1]*100, 1))
+
+
+summary_tab
+
+
+track <- cbind(out, sapply(ddF, getN), sapply(ddR, getN), sapply(merged, getN), rowSums(table.no.chimeras))
+colnames(track) <- c("input", "filtered", "denoisedF", "denoisedR", "merged", "nonchim")
+rownames(track) <- basename(fnFs)
+head(track)
+write.csv(track, "pipeline_stats.csv")
+
+#CLASSIFYING TO ASSIGN TAXONOMY
+system.time(tax <- assignTaxonomy(table.no.chimeras, "silva_nr99_v138.1_train_set.fa.gz", 
+                                  multi=TRUE))
+unname(head(tax))
+
+write.table(tax, file = 'taxonomy.tsv', sep = "\t", row.names = TRUE, col.names=NA, quote=FALSE)
+
+#reading in the metadata and creating a phyloseq object
+metadata <- read.csv("aims_1_2_metadata.csv") #importing the metadata
+row.names(metadata) <- metadata$seq_file #altering its format so row names are the sample ids
+
+
+#creating a 'phyloseq' object
+ps <- phyloseq(otu_table(table.no.chimeras, taxa_are_rows=FALSE), sample_data(metadata), tax_table(tax)) #making the phyloseq object
+
+library(tidyverse) ; packageVersion("tidyverse") # 1.3.1
+library(phyloseq) ; packageVersion("phyloseq") # 1.22.3
+library(vegan) ; packageVersion("vegan") # 2.5.4
+library(DESeq2) ; packageVersion("DESeq2") # 1.18.1
+library(dendextend) ; packageVersion("dendextend") # 1.10.0
+library(viridis) ; packageVersion("viridis") # 0.5.1
+library(decontam)
+
+seqtab <- makeSequenceTable(merged_amplicons)
+
+asv_seqs <- colnames(seqtab.nochim)
+asv_headers <- vector(dim(seqtab.nochim)[2], mode="character")
+
+for (i in 1:dim(seqtab.nochim)[2]) {
+    asv_headers[i] <- paste(">ASV", i, sep="_")
+}
+
+    # making and writing out a fasta of our final ASV seqs:
+asv_fasta <- c(rbind(asv_headers, asv_seqs))
+write(asv_fasta, "ASVs.fa")
+
+    # count table:
+asv_tab <- t(seqtab.nochim)
+row.names(asv_tab) <- sub(">", "", asv_headers)
+write.table(asv_tab, "ASVs_counts.tsv", sep="\t", quote=F, col.names=NA)
+
+    # tax table:
+    # creating table of taxonomy and setting any that are unclassified as "NA"
+ranks <- c("domain", "phylum", "class", "order", "family", "genus", "species")
+asv_tax <- t(sapply(tax_info, function(x) {
+    m <- match(ranks, x$rank)
+    taxa <- x$taxon[m]
+    taxa[startsWith(taxa, "unclassified_")] <- NA
+    taxa
+    }))
+colnames(asv_tax) <- ranks
+rownames(asv_tax) <- gsub(pattern=">", replacement="", x=asv_headers)
+
+write.table(asv_tax, "ASVs_taxonomy.tsv", sep = "\t", quote=F, col.names=NA)
+
+colnames(asv_tab) 
+
+contamdf.prev <- isContaminant(ps, method="prevalence", neg="negative")
+table(contamdf.prev$contaminant)
+
+contam_df <- isContaminant(t(asv_tab), neg=negative)
+
+table(contam_df$contaminant)
+contam_asvs <- row.names(contam_df[contam_df$contaminant == TRUE, ])
+
+tax[row.names(asv_tab) %in% contam_asvs, ]
+
+asv_tab_no_contam <- asv_tab[!row.names(asv_tab) %in% contam_asvs, ]
+asv_tax_no_contam <- tax[(!row.names(tax) %in% contam_asvs), ]
+
+
+asv_tab_no_contam<-asv_tab[asv_tab[,"primers-trimmed-GMCF-1240-Negative_S169_L001_R1_001.fastq"]==0,]
+asv_tax_no_contam<-asv_tax_no_contam[row.names(asv_tab_no_contam),]
+
+
+write(asv_fasta, "ASVs-no-contam.fa")
+write.table(asv_tab_no_contam, "ASVs_counts-no-contam.tsv",
+            sep="\t", quote=F, col.names=NA)
+write.table(asv_tax_no_contam, "ASVs_taxonomy-no-contam.tsv",
+            sep="\t", quote=F, col.names=NA)
+
+
+write(summary_tab, "sample_info.tsv")
+
+count_tab <- read.table("ASVs_counts-no-contam.tsv", header=T, row.names=1,
+                        check.names=F, sep="\t")[ , -c(1:4)]
+
+tax_tab <- as.matrix(read.table("ASVs_taxonomy-no-contam.tsv", header=T,
+                                row.names=1, check.names=F, sep="\t"))
+
+
+write.table(metadata, file = "sample_info.tsv", row.names=FALSE, sep="\t")
+
+
+sample_info_tab <- read.table("sample_info.tsv", header=T, row.names=1,
+                              check.names=F, sep="\t")                    
+
+# and setting the color column to be of type "character", which helps later
+sample_info_tab$color<- as.character(sample_info_tab$color)
+
+sample_info_tab
+
+#normalizing for sampling depth
+if (!require("BiocManager", quietly = TRUE))
+  install.packages("BiocManager")
+
+BiocManager::install("DESeq2")
+library(DESeq2)
+
+deseq_counts <- DESeqDataSetFromMatrix(count_tab, colData = sample_info_tab, design = ~type) 
+deseq_counts_vst <- varianceStabilizingTransformation(deseq_counts)
+vst_trans_count_tab <- assay(deseq_counts_vst)
+euc_dist <- dist(t(vst_trans_count_tab))
+
+sample_info_tab_phy <- sample_data(sample_info_tab)
+
+
+#rarefaction curve 
+rarecurve(t(asv_tab), step=100, col=as.factor(metadata$species), lwd=2, ylab="ASVs", label=F)
+abline(v=(min(rowSums(t(count_tab)))))
+
+
+#richness and biodiversity 
+count_tab_phy <- otu_table(count_tab, taxa_are_rows=T)
+tax_tab_phy <- tax_table(tax_tab)
+
+ASV_physeq <- phyloseq(count_tab_phy, tax_tab_phy, metadata)
+
+sample_rarefied_richness<-rarefy(t(asv_tab),sample = 25195) #this last number is based on your lowest (nonNegative sample) lowest reads
+print(sample_rarefied_richness)
+
+
+# and now we can call the plot_richness() function on our phyloseq object
+plot_richness(ASV_physeq, color="char", measures=c("Chao1", "Shannon")) + 
+  scale_color_manual(values=unique(metadata$color[order(metadata$species)])) +
+  theme_bw() + theme(legend.title = element_blank(), axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))
+
+
+#phylum bar plot
+phylum_barplot<-plot_bar(ps, "fecal_sample", fill="Phylum")+
+  labs(x="Sample", y="% of 16S rRNA gene copies recovered", title="MethodsPaperSamples")
+pdf(paste("/Users/russ/Desktop/phylum_species_barplot.pdf"), width = 30, height = 25)
+print(phylum_barplot)
+dev.off()
+
